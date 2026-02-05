@@ -380,10 +380,21 @@ class TestCreateDatabase:
         assert "Transportation" in sections
         assert "Transnational Issues" in sections
 
+    def test_fields_table(self, db):
+        count = db.execute("SELECT COUNT(*) FROM fields").fetchone()[0]
+        assert count == 175
+        # Check a specific field
+        row = db.execute(
+            "SELECT name FROM fields WHERE id = '279'"
+        ).fetchone()
+        assert row is not None
+        assert row[0] == "Area"
+
     def test_field_details_numeric_values(self, db):
         rows = db.execute(
-            "SELECT numeric_value FROM field_details "
-            "WHERE country_code = 'al' AND field_name = 'Area' AND subfield_name = 'total'"
+            "SELECT fd.numeric_value FROM field_details fd "
+            "JOIN fields fl ON fl.id = fd.field_id "
+            "WHERE fd.country_code = 'al' AND fl.name = 'Area' AND fd.subfield_name = 'total'"
         ).fetchall()
         assert len(rows) == 1
         assert float(rows[0][0]) == 28748.0
@@ -391,8 +402,8 @@ class TestCreateDatabase:
     def test_facts_fts(self, db):
         # Full-text search should work
         rows = db.execute(
-            "SELECT country_code, field_name FROM facts "
-            "WHERE rowid IN (SELECT rowid FROM facts_fts WHERE facts_fts MATCH 'petroleum') "
+            "SELECT f.country_code FROM facts f "
+            "WHERE f.rowid IN (SELECT rowid FROM facts_fts WHERE facts_fts MATCH 'petroleum') "
             "LIMIT 5"
         ).fetchall()
         assert len(rows) > 0
@@ -405,18 +416,41 @@ class TestCreateDatabase:
             ).fetchall()
         ]
         assert "idx_facts_country_code" in indexes
-        assert "idx_facts_field_name" in indexes
+        assert "idx_facts_field_id" in indexes
         assert "idx_field_details_country_code" in indexes
+
+    def test_foreign_keys_valid(self, db):
+        # PRAGMA foreign_key_check returns empty list when all FKs are valid
+        violations = db.execute("PRAGMA foreign_key_check").fetchall()
+        assert violations == []
+
+    def test_facts_foreign_keys_declared(self, db):
+        # Verify FK declarations exist on facts table
+        fks = db.execute("PRAGMA foreign_key_list(facts)").fetchall()
+        fk_tables = {row[2] for row in fks}
+        assert "countries" in fk_tables
+        assert "fields" in fk_tables
+
+    def test_field_details_foreign_keys_declared(self, db):
+        # Verify FK declarations exist on field_details table
+        fks = db.execute("PRAGMA foreign_key_list(field_details)").fetchall()
+        fk_tables = {row[2] for row in fks}
+        assert "countries" in fk_tables
+        assert "fields" in fk_tables
 
     def test_multiple_countries_have_population(self, db):
         count = db.execute(
-            "SELECT COUNT(DISTINCT country_code) FROM facts WHERE field_name = 'Population'"
+            "SELECT COUNT(DISTINCT f.country_code) FROM facts f "
+            "JOIN fields fl ON fl.id = f.field_id "
+            "WHERE fl.name = 'Population'"
         ).fetchone()[0]
         assert count > 200
 
     def test_background_field_has_text(self, db):
         row = db.execute(
-            "SELECT value FROM facts WHERE country_code = 'al' AND field_name = 'Background'"
+            "SELECT f.value FROM facts f "
+            "JOIN fields fl ON fl.id = f.field_id "
+            "WHERE f.country_code = 'al' AND fl.name = 'Background'"
         ).fetchone()
         assert row is not None
         assert "Albania" in row[0]

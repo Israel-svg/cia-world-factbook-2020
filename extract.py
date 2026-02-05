@@ -349,40 +349,45 @@ def create_database(db_path, data_dir):
     """Create the SQLite database and populate it from the factbook HTML files."""
     db = sqlite_utils.Database(db_path, recreate=True)
 
-    # Create tables
-    countries_table = db["countries"]
-    countries_table.insert({"code": "_placeholder_", "name": "", "region": ""}, pk="code")
-    countries_table.delete_where("code = ?", ["_placeholder_"])
+    # Create tables with explicit schema and foreign keys
+    db.execute("""
+        CREATE TABLE countries (
+            code TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            region TEXT NOT NULL
+        )
+    """)
 
-    facts_table = db["facts"]
-    facts_table.insert(
-        {
-            "id": 0,
-            "country_code": "",
-            "section": "",
-            "field_name": "",
-            "field_id": "",
-            "value": "",
-        },
-        pk="id",
-    )
-    facts_table.delete_where("id = ?", [0])
+    db.execute("""
+        CREATE TABLE fields (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL
+        )
+    """)
+
+    db.execute("""
+        CREATE TABLE facts (
+            id INTEGER PRIMARY KEY,
+            country_code TEXT NOT NULL REFERENCES countries(code),
+            field_id TEXT NOT NULL REFERENCES fields(id),
+            section TEXT NOT NULL,
+            value TEXT NOT NULL
+        )
+    """)
 
     db.execute("""
         CREATE TABLE field_details (
             id INTEGER PRIMARY KEY,
-            country_code TEXT,
-            section TEXT,
-            field_name TEXT,
-            field_id TEXT,
-            subfield_name TEXT,
-            value TEXT,
+            country_code TEXT NOT NULL REFERENCES countries(code),
+            field_id TEXT NOT NULL REFERENCES fields(id),
+            section TEXT NOT NULL,
+            subfield_name TEXT NOT NULL,
+            value TEXT NOT NULL,
             numeric_value REAL,
-            note TEXT,
-            date_info TEXT
+            note TEXT NOT NULL DEFAULT '',
+            date_info TEXT NOT NULL DEFAULT ''
         )
     """)
-    field_details_table = db["field_details"]
 
     country_files = get_country_files(data_dir)
     fact_id = 1
@@ -391,6 +396,7 @@ def create_database(db_path, data_dir):
     facts_batch = []
     details_batch = []
     countries_batch = []
+    fields_seen = {}
 
     for code, filepath in country_files:
         country_info, sections_data = parse_country_page(filepath)
@@ -400,14 +406,20 @@ def create_database(db_path, data_dir):
         )
 
         for section, field_name, field_id, full_text, subfields in sections_data:
+            if not field_id:
+                continue
+
+            # Track unique fields
+            if field_id not in fields_seen:
+                fields_seen[field_id] = field_name
+
             if full_text:
                 facts_batch.append(
                     {
                         "id": fact_id,
                         "country_code": code,
+                        "field_id": field_id,
                         "section": section,
-                        "field_name": field_name,
-                        "field_id": field_id or "",
                         "value": full_text,
                     }
                 )
@@ -418,9 +430,8 @@ def create_database(db_path, data_dir):
                     {
                         "id": detail_id,
                         "country_code": code,
+                        "field_id": field_id,
                         "section": section,
-                        "field_name": field_name,
-                        "field_id": field_id or "",
                         "subfield_name": sf["subfield_name"],
                         "value": sf["value"],
                         "numeric_value": sf["numeric_value"],
@@ -430,25 +441,28 @@ def create_database(db_path, data_dir):
                 )
                 detail_id += 1
 
-    # Batch insert
+    # Batch insert - fields first (referenced by facts and field_details)
+    fields_batch = [{"id": fid, "name": fname} for fid, fname in fields_seen.items()]
+    if fields_batch:
+        db["fields"].insert_all(fields_batch)
     if countries_batch:
-        countries_table.insert_all(countries_batch)
+        db["countries"].insert_all(countries_batch)
     if facts_batch:
-        facts_table.insert_all(facts_batch)
+        db["facts"].insert_all(facts_batch)
     if details_batch:
-        field_details_table.insert_all(details_batch)
+        db["field_details"].insert_all(details_batch)
 
     # Add indexes for common queries
     db["facts"].create_index(["country_code"], if_not_exists=True)
-    db["facts"].create_index(["field_name"], if_not_exists=True)
+    db["facts"].create_index(["field_id"], if_not_exists=True)
     db["facts"].create_index(["section"], if_not_exists=True)
-    db["facts"].create_index(["country_code", "field_name"], if_not_exists=True)
+    db["facts"].create_index(["country_code", "field_id"], if_not_exists=True)
     db["field_details"].create_index(["country_code"], if_not_exists=True)
-    db["field_details"].create_index(["field_name"], if_not_exists=True)
-    db["field_details"].create_index(["country_code", "field_name"], if_not_exists=True)
+    db["field_details"].create_index(["field_id"], if_not_exists=True)
+    db["field_details"].create_index(["country_code", "field_id"], if_not_exists=True)
 
-    # Enable FTS on facts
-    db["facts"].enable_fts(["value", "field_name", "section"], create_triggers=True)
+    # Enable FTS on facts (include field name via join-able field_id)
+    db["facts"].enable_fts(["value", "section"], create_triggers=True)
 
     # Create views for interesting data perspectives
     _create_views(db)
@@ -470,7 +484,8 @@ def _create_views(db):
             fd.date_info
         FROM countries c
         JOIN field_details fd ON fd.country_code = c.code
-        WHERE fd.field_name = 'Population'
+        JOIN fields fl ON fl.id = fd.field_id
+        WHERE fl.name = 'Population'
             AND fd.subfield_name = ''
             AND fd.numeric_value IS NOT NULL
         ORDER BY fd.numeric_value DESC
@@ -486,17 +501,18 @@ def _create_views(db):
             land.numeric_value AS land_sq_km,
             water.numeric_value AS water_sq_km
         FROM countries c
+        JOIN fields fl ON fl.name = 'Area'
         LEFT JOIN field_details total
             ON total.country_code = c.code
-            AND total.field_name = 'Area'
+            AND total.field_id = fl.id
             AND total.subfield_name = 'total'
         LEFT JOIN field_details land
             ON land.country_code = c.code
-            AND land.field_name = 'Area'
+            AND land.field_id = fl.id
             AND land.subfield_name = 'land'
         LEFT JOIN field_details water
             ON water.country_code = c.code
-            AND water.field_name = 'Area'
+            AND water.field_id = fl.id
             AND water.subfield_name = 'water'
         WHERE total.numeric_value IS NOT NULL
         ORDER BY total.numeric_value DESC
@@ -513,7 +529,8 @@ def _create_views(db):
             fd.date_info
         FROM countries c
         JOIN field_details fd ON fd.country_code = c.code
-        WHERE fd.field_name = 'GDP (purchasing power parity) - real'
+        JOIN fields fl ON fl.id = fd.field_id
+        WHERE fl.name = 'GDP (purchasing power parity) - real'
             AND fd.subfield_name = ''
             AND fd.numeric_value IS NOT NULL
         ORDER BY fd.numeric_value DESC
@@ -530,7 +547,8 @@ def _create_views(db):
             fd.date_info
         FROM countries c
         JOIN field_details fd ON fd.country_code = c.code
-        WHERE fd.field_name = 'Population growth rate'
+        JOIN fields fl ON fl.id = fd.field_id
+        WHERE fl.name = 'Population growth rate'
             AND fd.numeric_value IS NOT NULL
         ORDER BY fd.numeric_value DESC
     """)
@@ -546,17 +564,18 @@ def _create_views(db):
             female.numeric_value AS female_years,
             total.date_info
         FROM countries c
+        JOIN fields fl ON fl.name = 'Life expectancy at birth'
         JOIN field_details total
             ON total.country_code = c.code
-            AND total.field_name = 'Life expectancy at birth'
+            AND total.field_id = fl.id
             AND total.subfield_name = 'total population'
         LEFT JOIN field_details male
             ON male.country_code = c.code
-            AND male.field_name = 'Life expectancy at birth'
+            AND male.field_id = fl.id
             AND male.subfield_name = 'male'
         LEFT JOIN field_details female
             ON female.country_code = c.code
-            AND female.field_name = 'Life expectancy at birth'
+            AND female.field_id = fl.id
             AND female.subfield_name = 'female'
         WHERE total.numeric_value IS NOT NULL
         ORDER BY total.numeric_value DESC
@@ -571,7 +590,8 @@ def _create_views(db):
             f.value AS languages
         FROM countries c
         JOIN facts f ON f.country_code = c.code
-        WHERE f.field_name = 'Languages'
+        JOIN fields fl ON fl.id = f.field_id
+        WHERE fl.name = 'Languages'
         ORDER BY c.name
     """)
 
@@ -584,7 +604,8 @@ def _create_views(db):
             f.value AS religions
         FROM countries c
         JOIN facts f ON f.country_code = c.code
-        WHERE f.field_name = 'Religions'
+        JOIN fields fl ON fl.id = f.field_id
+        WHERE fl.name = 'Religions'
         ORDER BY c.name
     """)
 
@@ -597,7 +618,8 @@ def _create_views(db):
             f.value AS government_type
         FROM countries c
         JOIN facts f ON f.country_code = c.code
-        WHERE f.field_name = 'Government type'
+        JOIN fields fl ON fl.id = f.field_id
+        WHERE fl.name = 'Government type'
         ORDER BY c.name
     """)
 
@@ -613,13 +635,14 @@ def _create_views(db):
             pct.numeric_value AS pct_of_population,
             total.date_info
         FROM countries c
+        JOIN fields fl ON fl.name = 'Internet users'
         JOIN field_details total
             ON total.country_code = c.code
-            AND total.field_name = 'Internet users'
+            AND total.field_id = fl.id
             AND total.subfield_name = 'total'
         LEFT JOIN field_details pct
             ON pct.country_code = c.code
-            AND pct.field_name = 'Internet users'
+            AND pct.field_id = fl.id
             AND pct.subfield_name = 'percent of population'
         WHERE total.numeric_value IS NOT NULL
         ORDER BY total.numeric_value DESC
@@ -636,7 +659,8 @@ def _create_views(db):
             fd.date_info
         FROM countries c
         JOIN field_details fd ON fd.country_code = c.code
-        WHERE fd.field_name = 'Military expenditures'
+        JOIN fields fl ON fl.id = fd.field_id
+        WHERE fl.name = 'Military expenditures'
             AND fd.numeric_value IS NOT NULL
             AND fd.date_info != ''
         ORDER BY fd.numeric_value DESC
@@ -653,7 +677,8 @@ def _create_views(db):
             fd.date_info
         FROM countries c
         JOIN field_details fd ON fd.country_code = c.code
-        WHERE fd.field_name = 'Unemployment rate'
+        JOIN fields fl ON fl.id = fd.field_id
+        WHERE fl.name = 'Unemployment rate'
             AND fd.numeric_value IS NOT NULL
             AND fd.date_info != ''
         ORDER BY fd.numeric_value DESC
@@ -671,7 +696,8 @@ def _create_views(db):
             fd.date_info
         FROM countries c
         JOIN field_details fd ON fd.country_code = c.code
-        WHERE fd.field_name = 'Electricity - production by source'
+        JOIN fields fl ON fl.id = fd.field_id
+        WHERE fl.name = 'Electricity - production by source'
             AND fd.subfield_name != ''
             AND fd.numeric_value IS NOT NULL
         ORDER BY c.name, fd.subfield_name
@@ -686,7 +712,8 @@ def _create_views(db):
             f.value AS climate
         FROM countries c
         JOIN facts f ON f.country_code = c.code
-        WHERE f.field_name = 'Climate'
+        JOIN fields fl ON fl.id = f.field_id
+        WHERE fl.name = 'Climate'
         ORDER BY c.name
     """)
 
@@ -699,7 +726,8 @@ def _create_views(db):
             f.value AS natural_resources
         FROM countries c
         JOIN facts f ON f.country_code = c.code
-        WHERE f.field_name = 'Natural resources'
+        JOIN fields fl ON fl.id = f.field_id
+        WHERE fl.name = 'Natural resources'
         ORDER BY c.name
     """)
 
@@ -718,12 +746,13 @@ def _create_views(db):
     db.execute("""
         CREATE VIEW IF NOT EXISTS field_coverage AS
         SELECT
-            field_name,
-            section,
-            COUNT(DISTINCT country_code) AS countries_with_data,
-            field_id
-        FROM facts
-        GROUP BY field_name, section
+            fl.name AS field_name,
+            f.section,
+            COUNT(DISTINCT f.country_code) AS countries_with_data,
+            f.field_id
+        FROM facts f
+        JOIN fields fl ON fl.id = f.field_id
+        GROUP BY fl.name, f.section
         ORDER BY countries_with_data DESC
     """)
 
@@ -737,11 +766,13 @@ def main():
     db = create_database(args.output, args.data_dir)
 
     countries_count = db.execute("SELECT COUNT(*) FROM countries").fetchone()[0]
+    fields_count = db.execute("SELECT COUNT(*) FROM fields").fetchone()[0]
     facts_count = db.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
     details_count = db.execute("SELECT COUNT(*) FROM field_details").fetchone()[0]
 
     print(f"Created {args.output}:")
     print(f"  {countries_count} countries")
+    print(f"  {fields_count} fields")
     print(f"  {facts_count} facts")
     print(f"  {details_count} field details")
 
